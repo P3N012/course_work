@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "driver/spi_master.h"
 #include "driver/rc522_spi.h"
 #include "rc522.h"
@@ -17,6 +18,9 @@
 #define PIN_MISO   19
 #define PIN_SCLK   18
 #define ENTRY_CS   5
+#define SERVO_ENTRY_PIN 25
+#define SERVO_CLOSED_US  500    // door closed, arm at about 0 degrees
+#define SERVO_OPEN_US   1470    // door open, arm at about 90 degrees
 #define RST 4
 #define EXIT_CS 17
 #define SD_CS 16
@@ -88,6 +92,41 @@ void leds_init(void) {
     gpio_set_level(LED_ENTRY_RED, 0);
 }
 
+void servo_init(void) {
+    ledc_timer_config_t timer_config = {
+        .speed_mode = LEDC_HIGH_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_14_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 50,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_config));
+
+    ledc_channel_config_t channel_config = {
+        .gpio_num = SERVO_ENTRY_PIN,
+        .speed_mode = LEDC_HIGH_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&channel_config));
+}
+
+void servo_set_pulse_us(uint32_t pulse_us) {
+    uint32_t duty = (pulse_us * (1 << 14)) / 20000; // 20ms period for 50Hz
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0));
+}
+
+void door_open(void) {
+    servo_set_pulse_us(SERVO_OPEN_US); // Open position
+}
+
+void door_close(void) {
+    servo_set_pulse_us(SERVO_CLOSED_US); // Close position
+}
+
 void door_task(void *arg) {
     scan_event_t event;
     while (1) {
@@ -95,7 +134,9 @@ void door_task(void *arg) {
             if (event.valid) {
                 ESP_LOGI(TAG, "Door opened for tag: %s", event.uid);
                 gpio_set_level(LED_ENTRY_GREEN, 1);
+                door_open();
                 vTaskDelay(pdMS_TO_TICKS(3000));
+                door_close();
                 gpio_set_level(LED_ENTRY_GREEN, 0);
             } else {
                 ESP_LOGW(TAG, "Access denied for tag: %s", event.uid);
@@ -184,6 +225,8 @@ void app_main(void)
         esp_log_level_set("rc522", ESP_LOG_NONE);
         deselect_other_devices();
         leds_init();
+        servo_init();
+        door_close();
         scan_queue = xQueueCreate(5, sizeof(scan_event_t));
         xTaskCreate(door_task, "door_task", 4096, NULL, 5, NULL);
         entry_reader_start();
