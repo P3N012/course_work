@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "driver/rc522_spi.h"
@@ -10,6 +11,8 @@
 #include "esp_log.h"
 
 
+#define LED_ENTRY_GREEN 32
+#define LED_ENTRY_RED   33
 #define PIN_MOSI   23
 #define PIN_MISO   19
 #define PIN_SCLK   18
@@ -17,6 +20,13 @@
 #define RST 4
 #define EXIT_CS 17
 #define SD_CS 16
+
+typedef struct {
+    char uid[RC522_PICC_UID_STR_BUFFER_SIZE_MAX];
+    bool valid;
+}scan_event_t;
+
+static QueueHandle_t scan_queue;
 
 #define SPI_HOST   SPI3_HOST   // TODO 0: your choice, SPI2_HOST or SPI3_HOST. Be ready to say why.
 
@@ -68,6 +78,37 @@ bool tag_is_valid(const char *uid_str)
     return false;
 }
 
+void leds_init(void) {
+    gpio_reset_pin(LED_ENTRY_GREEN);
+    gpio_set_direction(LED_ENTRY_GREEN, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_ENTRY_GREEN, 0);
+
+    gpio_reset_pin(LED_ENTRY_RED);
+    gpio_set_direction(LED_ENTRY_RED, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_ENTRY_RED, 0);
+}
+
+void door_task(void *arg) {
+    scan_event_t event;
+    while (1) {
+        if (xQueueReceive(scan_queue, &event, portMAX_DELAY)) {
+            if (event.valid) {
+                ESP_LOGI(TAG, "Door opened for tag: %s", event.uid);
+                gpio_set_level(LED_ENTRY_GREEN, 1);
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                gpio_set_level(LED_ENTRY_GREEN, 0);
+            } else {
+                ESP_LOGW(TAG, "Access denied for tag: %s", event.uid);
+                gpio_set_level(LED_ENTRY_RED, 1);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                gpio_set_level(LED_ENTRY_RED, 0);
+            }
+        }
+    }
+}
+
+
+
 static void on_picc_state_changed(void *arg, esp_event_base_t base, int32_t event_id, void *data)
 {
     rc522_picc_state_changed_event_t *event = (rc522_picc_state_changed_event_t *)data;
@@ -80,7 +121,6 @@ static void on_picc_state_changed(void *arg, esp_event_base_t base, int32_t even
     //REPLACE the rc522_picc_print(picc) line with:
     char uid_str[RC522_PICC_UID_STR_BUFFER_SIZE_MAX];
     //- call rc522_picc_uid_to_str(&picc->uid, uid_str, sizeof(uid_str))
-    rc522_picc_uid_to_str(&picc->uid, uid_str, sizeof(uid_str));
     // and check that it returned ESP_OK
     if (rc522_picc_uid_to_str(&picc->uid, uid_str, sizeof(uid_str)) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to convert UID to string");
@@ -88,6 +128,14 @@ static void on_picc_state_changed(void *arg, esp_event_base_t base, int32_t even
     }
     ESP_LOGI(TAG, "Tag scanned: %s -> %s", uid_str,
         tag_is_valid(uid_str) ? "VALID" : "DENIED");
+    
+// TODO 3: in on_picc_state_changed, after you work out VALID/DENIED:
+//         build a scan_event_t (copy uid_str into ev.uid, set ev.valid)
+    scan_event_t ev;
+    strncpy(ev.uid, uid_str, sizeof(ev.uid));
+    ev.valid = tag_is_valid(uid_str);
+    xQueueSend(scan_queue, &ev, 0);
+//         The timeout is 0 on purpose: the callback must never wait.
 }
 
 static rc522_driver_handle_t entry_driver;
@@ -135,6 +183,9 @@ void app_main(void)
         ESP_LOGI(TAG, "SPI bus ready");
         esp_log_level_set("rc522", ESP_LOG_NONE);
         deselect_other_devices();
+        leds_init();
+        scan_queue = xQueueCreate(5, sizeof(scan_event_t));
+        xTaskCreate(door_task, "door_task", 4096, NULL, 5, NULL);
         entry_reader_start();
     } else {
         ESP_LOGE(TAG, "Failed to setup SPI bus: %s", esp_err_to_name(value));
